@@ -143,3 +143,7 @@ already read.
 NVFP4 pack, `dynamic`, 400 W + 180 W, cold, time to the first token: a 30 s 1280x720 clip (8,202 prompt tokens) 2.7 s; a minute of
 3840x2160 HEVC 5.2 s (decode 2.6 s, encode 0.3 s, prompt read 1.9 s); of 1920x1080 H.264 4.3 s. A new question on the same 30 s
 clip: 0.4 s.
+
+## Alcure integration
+
+See [local controls](alcure.md) and [token counting](token-counting.md).
