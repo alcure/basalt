@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from serve.api import responses as responses_api
@@ -20,19 +21,22 @@ from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStart
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
 from serve.config import checked_sampling
-from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
+from serve.frontend import anthropic_to_messages, forced_call, images_of, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.router import Router
-from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
+from serve.service import CONTROL_FEATURES, LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
 
 
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
+# Admission begins before the body identifies a model, so it covers every service.
+WORK_PATHS = ("/v1/responses", "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens",
+              "/v1/vram", "/v1/load", "/load")
 
 
 class BadBody(Exception):
@@ -132,6 +136,32 @@ def make_handler(target: Service | Router):
                 self.close_connection = True
                 raise BadBody(413, f"the request body is larger than {_size_text(limit)}")
             return self.rfile.read(length)
+
+        def _discard_body(self) -> None:
+            """Read the request body and throw it away, so the client reads the answer and not a reset.
+
+            The whole body is drained (as much as a request may hold): a client that
+            is still sending must not lose the answer to a reset.
+            """
+            try:
+                if self._chunked():
+                    self._read_chunked(BODY_MAX, keep=False)
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+            except (BadBody, ValueError):
+                self.close_connection = True
+                return
+            if length <= 0:
+                return
+            if length > BODY_MAX:
+                self.close_connection = True
+                return
+            left = length
+            while left > 0:
+                piece = self.rfile.read(min(left, 1 << 20))
+                if not piece:
+                    break
+                left -= len(piece)
 
         def _foreign_page(self) -> bool:
             """Without an API key, refuse a /v1 POST from another site's page: its Origin must be allowed (no Origin
@@ -322,7 +352,9 @@ def make_handler(target: Service | Router):
                 self._json(200, {"status": "ok", "max_context": shown.engine.max_context, "model": shown.model,
                                  "images": shown.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": shown.loaded(), "loading": shown.loading, "service": "basalt",
-                                 "percent": load.get("percent") if load else None, "swap": router.swap_status()})
+                                 "percent": load.get("percent") if load else None, "swap": router.swap_status(),
+                                 "control_features": list(CONTROL_FEATURES), "maintenance": shown.maintenance,
+                                 "pack": shown.pack_info()})
             elif path == "/status":
                 if not self._authorized():                  # it shows the last answer's tail
                     return
@@ -363,6 +395,27 @@ def make_handler(target: Service | Router):
             path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
+            admitted = []
+            try:
+                if path in WORK_PATHS:
+                    for service in router.services:
+                        if not service.admit_work():
+                            self.close_connection = True
+                            self._discard_body()
+                            if path == "/v1/responses":
+                                self._json(409, responses_error_body("the model is in maintenance", "server_error",
+                                                                     code="model_busy"))
+                            else:
+                                self._json(409, {"error": {"type": "model_busy",
+                                                           "message": "the model is in maintenance"}})
+                            return
+                        admitted.append(service)
+                self._post_admitted(path)
+            finally:
+                for service in reversed(admitted):
+                    service.end_work()
+
+        def _post_admitted(self, path):
             if path in ("/unload", "/load") and not self._control_body():
                 return
             # own page and JSON only: a form POST from any site must not control the model
@@ -382,6 +435,8 @@ def make_handler(target: Service | Router):
                     self._take_turn()
                     self.svc.load()
                     self._json(200, {"status": "loaded"})
+                except ModelBusy as e:                     # a maintenance reservation holds the door shut
+                    self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
                 except (GpuBusy, EngineDied) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 except ClientGone:
@@ -406,10 +461,33 @@ def make_handler(target: Service | Router):
                         return
                     self.svc = target
                     if path == "/v1/unload":
-                        result = target.unload()
-                        if result == "busy":
-                            raise ModelBusy("a request is running or queued")
-                    elif target.loading:                 # a load in progress: wait for it like any request
+                        reserve = req.get("reserve")
+                        if "reserve" in req and not isinstance(reserve, bool):
+                            raise ValueError("reserve: true or false")
+                        if reserve is True:
+                            # Router's preload can swap without an HTTP admission.
+                            with router.cv:
+                                if (router.swap or router.queue or router.running or
+                                        any(service.maintenance for service in router.services)):
+                                    raise ModelBusy("a request is running or queued")
+                                result = target.begin_reservation()
+                            if result == "reserving":
+                                result = target.finish_reservation()
+                            if result == "busy":
+                                raise ModelBusy("a request is running or queued")
+                            if result == "unsupported":
+                                self._json(503, {"error": {"type": "server_error",
+                                                          "message": "this engine cannot be unloaded"}})
+                                return
+                        elif reserve is False:
+                            if not target.release_maintenance():
+                                raise ModelBusy("the reservation is still being established")
+                            result = "released"
+                        else:
+                            result = target.unload()
+                            if result == "busy":
+                                raise ModelBusy("a request is running or queued")
+                    elif target.loading:
                         self._take_turn()
                         target.load()
                         result = "loaded"
@@ -776,11 +854,24 @@ def make_handler(target: Service | Router):
             return ids, thinking, tools, max_new, asm, req, force
 
         def _count_tokens(self, req):
-            """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
+            """Count the rendered prompt and visual rows, without generating a reply."""
             messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)
-            tools, _ = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)   # same 400 as the request itself ("none": no tools)
-            stop_strings(req)                                 # same 400 as the request itself
-            self._json(200, {"input_tokens": len(self.svc.encode_prompt(messages, tools, kw))})
+            tools, _ = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)
+            stop_strings(req)
+            if images_of(messages):
+                self._take_turn()
+                self.svc.load()
+                try:
+                    ids, _, _ = self.svc.prepare(messages, tools, kw, 1)
+                    count = len(ids)
+                finally:
+                    path = getattr(self.svc.embeddings, "path", None)
+                    if path:
+                        Path(path).unlink(missing_ok=True)
+                        self.svc.embeddings.path = None
+            else:
+                count = len(self.svc.encode_prompt(messages, tools, kw))
+            self._json(200, {"input_tokens": count})
 
         def _anthropic(self, req):
             messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)

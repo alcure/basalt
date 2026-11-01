@@ -100,6 +100,40 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(s2, 200)
         self.assertEqual(b["input_tokens"], n_in)
 
+    def test_count_tokens_includes_visual_rows_without_generating(self):
+        class CountedVision:
+            def __init__(self, directory):
+                self.directory = Path(directory)
+                self.files = []
+
+            def encode(self, sources):
+                path = self.directory / f"req-{len(self.files)}.sve"
+                path.write_bytes(b"synthetic vision rows")
+                self.files.append(path)
+                return path, [7, 19][:len(sources)]
+
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "Compare these two synthetic images."},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "YQ=="}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "Yg=="}},
+        ]}]
+        with tempfile.TemporaryDirectory() as directory:
+            vision = CountedVision(directory)
+            with mock.patch.object(self.svc, "vision", vision):
+                with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generated:
+                    status, counted = self.post("/v1/messages/count_tokens", {
+                        "model": "basalt", "messages": messages,
+                    })
+                    self.assertEqual(status, 200, counted)
+                    generated.assert_not_called()
+                self.assertEqual(len(vision.files), 1)
+                self.assertFalse(vision.files[0].exists())
+                status, answer = self.post("/v1/messages", {
+                    "model": "basalt", "messages": messages, "max_tokens": 8,
+                })
+                self.assertEqual(status, 200, answer)
+                self.assertEqual(counted["input_tokens"], answer["usage"]["input_tokens"])
+
     def test_request_line_parses_the_engine_summary(self):
         line = ("basalt serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
@@ -1599,20 +1633,19 @@ class StartFailureLog(unittest.TestCase):
                     ProcessEngine("basalt", [], log=str(log))
             self.assertIn("exited before it was ready", str(cm.exception))
 
-    def test_a_failed_reload_says_so_and_raises_engine_died(self):
+    def test_failed_reload_propagates_engine_failure_and_clears_loading(self):
         eng = mock.Mock(unloaded=True)
         eng.loaded = lambda: False
         eng.restart.side_effect = EngineStartError("no room", "/x/engine.log")
-        svc = Service.__new__(Service)
-        svc.engine, svc.vision, svc.before_load, svc.min_free_vram_mib = eng, None, None, 0
-        svc.vram_reserve = None
-        svc.stopping = threading.Event()
+        tok = ByteTokenizer()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         out = io.StringIO()
         with mock.patch.object(Service, "loaded", lambda self: False), \
                 mock.patch.object(Service, "_vision_down", lambda self: False), \
                 contextlib.redirect_stdout(out):
-            with self.assertRaises(EngineDied):
+            with svc.fifo, self.assertRaises(EngineDied):
                 svc.ensure_loaded()
+        self.assertFalse(svc.loading)
         self.assertIn("[server] error: no room", out.getvalue())
         self.assertIn("[server] engine log: /x/engine.log", out.getvalue())
 

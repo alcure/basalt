@@ -116,6 +116,8 @@ class Router:
     def preload(self, svc) -> None:
         """Load `svc` through the queue, with no request behind it."""
         with self.cv:
+            if any(service.maintenance for service in self.services):
+                return                                  # startup must not bypass a maintenance reservation
             self.queue.append(Turn(svc, holds=False))
             self._start_worker()
             self.cv.notify_all()
