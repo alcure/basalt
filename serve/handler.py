@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from serve.api import responses as responses_api
@@ -18,18 +19,23 @@ from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.engine.errors import EngineDied, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
-from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
+from serve.frontend import anthropic_to_messages, forced_call, images_of, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
-from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
+from serve.service import CONTROL_FEATURES, LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
 
 
 BODY_MAX = 256 << 20                        # the most a JSON request body may hold (read into memory)
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
+# The paths that use the model, the GPU or the engine's own state: they hold the
+# admission for their whole life, so a pack swap cannot start while one is on its
+# way. The reserve itself (/v1/unload with reserve) is not one of them.
+WORK_PATHS = ("/v1/responses", "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens",
+              "/v1/vram", "/v1/load")
 
 
 class BadBody(Exception):
@@ -123,6 +129,32 @@ def make_handler(svc: Service):
                 self.close_connection = True
                 raise BadBody(413, f"the request body is larger than {_size_text(limit)}")
             return self.rfile.read(length)
+
+        def _discard_body(self) -> None:
+            """Read the request body and throw it away, so the client reads the answer and not a reset.
+
+            The whole body is drained (as much as a request may hold): a client that
+            is still sending must not lose the answer to a reset.
+            """
+            try:
+                if self._chunked():
+                    self._read_chunked(BODY_MAX, keep=False)
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+            except (BadBody, ValueError):
+                self.close_connection = True
+                return
+            if length <= 0:
+                return
+            if length > BODY_MAX:
+                self.close_connection = True
+                return
+            left = length
+            while left > 0:
+                piece = self.rfile.read(min(left, 1 << 20))
+                if not piece:
+                    break
+                left -= len(piece)
 
         def _foreign_page(self) -> bool:
             """Without an API key, refuse a /v1 POST from another site's page: its Origin must be allowed (no Origin
@@ -259,7 +291,9 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "loaded": svc.loaded(), "loading": svc.loading, "service": "basalt"})
+                                 "loaded": svc.loaded(), "loading": svc.loading, "service": "basalt",
+                                 "control_features": list(CONTROL_FEATURES), "maintenance": svc.maintenance,
+                                 "pack": svc.pack_info()})
             elif path == "/status":
                 if not self._authorized():                  # it shows the last answer's tail
                     return
@@ -324,10 +358,28 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
+                except ModelBusy as e:                     # a maintenance reservation holds the door shut
+                    self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
                 except (GpuBusy, EngineDied) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
+            admitted = False
             try:
+                if path in WORK_PATHS:
+                    # A work request holds the admission from the first byte of its
+                    # body: a pack swap cannot start while one is on its way.
+                    if not svc.admit_work():
+                        # The body is not read: the connection cannot be reused, or the
+                        # client would read the next answer on top of this one.
+                        self.close_connection = True
+                        self._discard_body()      # the client must read the answer, not a reset
+                        if path == "/v1/responses":
+                            self._json(409, responses_error_body("the model is in maintenance", "server_error",
+                                                                 code="model_busy"))
+                        else:
+                            self._json(409, {"error": {"type": "model_busy", "message": "the model is in maintenance"}})
+                        return
+                    admitted = True
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
@@ -342,9 +394,27 @@ def make_handler(svc: Service):
                         self._json(404, {"error": {"message": "model not found"}})
                         return
                     if path == "/v1/unload":
-                        result = svc.unload()
-                        if result == "busy":
-                            raise ModelBusy("a request is running or queued")
+                        reserve = req.get("reserve", None)
+                        if "reserve" in req and not isinstance(reserve, bool):
+                            raise ValueError("reserve: true or false")
+                        if reserve is True:
+                            # A reservation closes the admission and frees the
+                            # weights: the pack file can then be swapped.
+                            result = svc.reserve_maintenance()
+                            if result == "busy":
+                                raise ModelBusy("a request is running or queued")
+                            if result == "unsupported":
+                                self._json(503, {"error": {"type": "server_error",
+                                                     "message": "this engine cannot be unloaded"}})
+                                return
+                        elif reserve is False:
+                            if not svc.release_maintenance():
+                                raise ModelBusy("the reservation is still being established")
+                            result = "released"
+                        else:
+                            result = svc.unload()
+                            if result == "busy":
+                                raise ModelBusy("a request is running or queued")
                     else:
                         if not svc.fifo.acquire(blocking=False):
                             raise ModelBusy("a request is running or queued")
@@ -406,6 +476,8 @@ def make_handler(svc: Service):
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
             finally:
+                if admitted:
+                    svc.end_work()                           # every admitted request leaves the work section
                 if self.watch_done is not None:
                     self.watch_done.set()
 
@@ -676,11 +748,23 @@ def make_handler(svc: Service):
             return ids, thinking, tools, max_new, asm, req, force
 
         def _count_tokens(self, req):
-            """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
+            """Count the rendered prompt and visual rows, without generating a reply."""
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             tools, _ = forced_call(req.get("tool_choice"), tools)   # same 400 as the request itself ("none": no tools)
             stop_strings(req)                                 # same 400 as the request itself
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+            if images_of(messages):
+                svc.load()
+                try:
+                    ids, _, _ = svc.prepare(messages, tools, kw, 1)
+                    count = len(ids)
+                finally:
+                    path = getattr(svc.embeddings, "path", None)
+                    if path:
+                        Path(path).unlink(missing_ok=True)
+                        svc.embeddings.path = None
+            else:
+                count = len(svc.encode_prompt(messages, tools, kw))
+            self._json(200, {"input_tokens": count})
 
         def _anthropic(self, req):
             svc.load()

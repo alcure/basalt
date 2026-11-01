@@ -10,6 +10,26 @@ GiB, and a `--idle-sleep` wake reads `Waking up`. `/metrics` has `live.state` `l
 or `wake`; `/v1/status` and `/health` carry `loading`. Requests wait, then are served; a failed load gives them a 503 in
 the API's own error shape. The start-up load tries once and a failure ends the server; reloads try up to 3 times.
 
+## Coordinated pack swaps
+
+`/health` and `/v1/status` expose `control_features: ["maintenance_reservation"]`,
+`maintenance`, and `pack: {filename, size_bytes, mtime_ns}`. The pack identity comes
+from the engine's actual model path, not a configuration file; only file metadata
+is read. An unavailable file produces `pack: null`, not an assumed identity.
+
+`POST /v1/unload {"model": "<alias>", "reserve": true}` atomically refuses a busy
+runtime or closes admission and unloads it. Already admitted requests, including
+body reading and token counting, keep a swap out. New work and load requests
+receive HTTP 409 `model_busy` while reserved. A second reservation is also refused.
+`reserve: false` reopens admission without loading weights; while the unload is
+still running it returns 409 without reopening. The flag must be a JSON boolean;
+omitting it preserves ordinary unload.
+
+The reservation belongs to the daemon's lifetime and disappears on restart. It is
+not an ownership token: cooperating controllers must serialize their transitions
+and coordinate other GPU engines separately. Do not release another controller's
+reservation.
+
 ## Concurrent requests: `--parallel N`
 
 `--parallel N` (1..8, also `"parallel"` in the config's `server` section) serves N requests at once in the
@@ -265,7 +285,7 @@ at startup with CUDA's own error, which the server shows. Sidecars on non-Blackw
 The image encoder is Basalt's own, written for this model's vision tower (no llama.cpp or ggml): bf16 tensor-core
 products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on the CPU. It replaces llama.cpp's
 mtmd encoder as a drop-in, is faster at every image size, and stays closer to an fp32 reference: mtmd's fp16 attention
-drifts on large images. One image is capped at 64 megapixels; a header past it is refused before it is decoded.
+drifts on large images. One image is capped at 64 megapixels; a header past it is refused before it is decoded. See [token counting](token-counting.md) for text and image budgets.
 
 ## `PROBE rates` (engine command)
 
