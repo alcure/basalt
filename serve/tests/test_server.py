@@ -106,6 +106,9 @@ class MaxTokens(unittest.TestCase):
                 self.directory = Path(directory)
                 self.files = []
 
+            def read(self, sources, allowed=None):
+                return [s.encode() if isinstance(s, str) else s for s in sources]
+
             def encode(self, sources):
                 path = self.directory / f"req-{len(self.files)}.sve"
                 path.write_bytes(b"synthetic vision rows")

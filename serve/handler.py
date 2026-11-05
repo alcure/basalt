@@ -919,7 +919,7 @@ def make_handler(target: Service | Router):
                 self._take_turn()
                 self.svc.load()
                 try:
-                    ids, _, _ = self.svc.prepare(messages, tools, kw, 1)
+                    ids, _, _ = self.svc.prepare(messages, tools, kw, 1, image_access=self._image_access())
                     count = len(ids)
                 finally:
                     path = getattr(self.svc.embeddings, "path", None)

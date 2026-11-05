@@ -501,12 +501,11 @@ class EveryFrontend(ImageServer):
                                          {"type": "image_url", "image_url": {"url": str(self.image)}}]}]}
         self.assertRefused(self.post("/v1/chat/completions", body), "--image-dir")
 
-    def test_count_tokens_reads_nothing(self):
+    def test_count_tokens_applies_the_image_policy(self):
+        # counting the visual rows reads the images, so a path from a remote peer is refused like on every endpoint
         self.start(peer=(("203.0.113.9", 1),))
-        with mock.patch.object(image_source, "_read_allowed_file") as read:
-            body = frontends(str(self.image))["anthropic path"][1]
-            self.assertEqual(self.post("/v1/messages/count_tokens", body)[0], 200)
-        read.assert_not_called()
+        body = frontends(str(self.image))["anthropic path"][1]
+        self.assertRefused(self.post("/v1/messages/count_tokens", body), "--image-dir")
 
     def test_service_default_is_remote(self):
         # a caller that names no access gets the remote policy
