@@ -1641,7 +1641,7 @@ class StartFailureLog(unittest.TestCase):
         eng.loaded = lambda: False
         eng.restart.side_effect = EngineStartError("no room", "/x/engine.log")
         tok = ByteTokenizer()
-        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(eng, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         out = io.StringIO()
         with mock.patch.object(Service, "loaded", lambda self: False), \
                 mock.patch.object(Service, "_vision_down", lambda self: False), \
