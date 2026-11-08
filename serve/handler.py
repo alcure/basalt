@@ -177,7 +177,7 @@ def make_handler(target: Service | Router):
             """
             try:
                 if self._chunked():
-                    self._read_chunked(BODY_MAX, keep=False)
+                    self._read_chunked(svc.max_payload, keep=False)
                     return
                 length = int(self.headers.get("Content-Length", 0))
             except (BadBody, ValueError):
@@ -185,7 +185,7 @@ def make_handler(target: Service | Router):
                 return
             if length <= 0:
                 return
-            if length > BODY_MAX:
+            if length > svc.max_payload:
                 self.close_connection = True
                 return
             left = length

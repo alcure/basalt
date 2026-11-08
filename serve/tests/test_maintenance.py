@@ -214,6 +214,36 @@ class Maintenance(unittest.TestCase):
         # the server is untouched by the refusal
         self.assertEqual(self.chat()[0], 409)
 
+    def test_refused_chunked_and_oversized_bodies_use_the_configured_limit(self):
+        self.assertEqual(self.reserve()[0], 200)
+        self.svc.max_payload = 16
+        cases = (
+            ("/load", b"Transfer-Encoding: chunked\r\nContent-Length: 999\r\n",
+             b"4\r\nabcd\r\n4\r\nefgh\r\n0\r\nX-Trailer: value\r\n\r\n"),
+            ("/v1/responses", b"Transfer-Encoding: chunked\r\n",
+             b"4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n"),
+            ("/v1/chat/completions", b"Transfer-Encoding: chunked\r\n", b"11\r\n"),
+            ("/v1/load", b"Content-Length: 17\r\n", b""),
+        )
+        for path, framing, body in cases:
+            with self.subTest(path=path, framing=framing):
+                request = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                           "Content-Type: application/json\r\nConnection: close\r\n").encode()
+                with socket.create_connection(("127.0.0.1", self.httpd.server_address[1]), timeout=10) as sock:
+                    sock.sendall(request + framing + b"\r\n" + body)
+                    answer = b""
+                    while piece := sock.recv(4096):
+                        answer += piece
+                headers, _, payload = answer.partition(b"\r\n\r\n")
+                length = next(int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n")
+                              if line.lower().startswith(b"content-length:"))
+                self.assertEqual(len(payload), length)
+                self.assertIn(b" 409 ", headers.split(b"\r\n")[0])
+                error = json.loads(payload)["error"]
+                self.assertEqual(error.get("code") if path == "/v1/responses" else error["type"], "model_busy")
+        self.assertEqual(self.svc.work_active, 0)
+        self.assertTrue(self.svc.maintenance)
+
 
 class ReservationWhileBusy(unittest.TestCase):
     """A request in flight keeps the reservation out and is not harmed by it."""
