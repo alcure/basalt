@@ -25,6 +25,9 @@ reserved model are also refused. A second reservation is refused. Send
 `reserve: false` for the same model to reopen admission without loading weights;
 while the unload is still running it returns 409 without reopening. The flag must
 be a JSON boolean; omitting it preserves ordinary unload.
+For refused work, the server drains a Content-Length or chunked body up to the
+configured `--max-payload-mib` limit before replying, then closes the connection.
+It does not wait to read a body announced beyond that limit.
 
 The reservation belongs to the daemon's lifetime and disappears on restart. It is
 not an ownership token: cooperating controllers must serialize their transitions
