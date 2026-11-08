@@ -57,7 +57,7 @@ class Maintenance(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = ScriptedEngine(tok, "Hello.")
-        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name=ALIAS)
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), model_name=ALIAS)
         self.router = Router([self.svc])
         self.httpd = serve(self.router, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -221,7 +221,7 @@ class ReservationWhileBusy(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = BlockingEngine(tok, "Hello.")
-        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name=ALIAS)
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), model_name=ALIAS)
         self.router = Router([self.svc])
         self.httpd = serve(self.router, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -287,7 +287,7 @@ class ReservationInProgress(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = SlowUnloadEngine(tok, "Hello.")
-        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name=ALIAS)
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), model_name=ALIAS)
         self.router = Router([self.svc])
         self.httpd = serve(self.router, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -342,7 +342,7 @@ class MultiModelMaintenance(unittest.TestCase):
 
     def setUp(self):
         tok = ByteTokenizer()
-        template = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        template = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
         self.engines = {name: ScriptedEngine(tok, "Hello.") for name in (ALIAS, "other")}
         self.engines["other"].unloaded = True
         self.services = {name: Service(engine, tok, template, model_name=name)
