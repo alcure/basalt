@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# The persistent unit shares its lock and logs with the periodic updater.
+systemctl --user start --no-block alcure-basalt-update.service
