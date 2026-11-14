@@ -1,11 +1,12 @@
 """Service: the engine behind a lock, with request bookkeeping and the metrics the stats page reads."""
 from __future__ import annotations
 
+from serve.alcure import MaintenanceControls
+
 import collections
 import contextlib
 import ctypes
 import inspect
-import os
 import subprocess
 import threading
 import time
@@ -65,11 +66,9 @@ BEST_MAX_READ_TOK_S = 200000  # a prompt read faster than this pairs the wrong t
 RATE_MIN_SPAN_S = 0.25      # below this span there is no rate yet: use the mean with the span floored
 # diagnostics, off unless the server flag sets them
 DEBUG = False            # --debug: one line per request plus the raw model text
-# the control features this runtime offers, announced in /health and /v1/status
-CONTROL_FEATURES = ("maintenance_reservation",)   # a reservation closes the admission for a pack swap
 
 
-class Service:
+class Service(MaintenanceControls):
     loading = booting = False                      # a load or wake runs; the start-up load runs
     load_kind = "weights"                               # what the running load is: "weights" or "wake"
     on_loaded = None                                    # called after each weights load or wake this service ran
@@ -94,93 +93,6 @@ class Service:
             names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
         return names
 
-    def pack_info(self) -> dict | None:
-        """The real pack this server serves: file name, size and mtime of the loaded file.
-
-        It comes from the engine's own model path (the file it was given), never from
-        a configuration file, and only the file's metadata is read: the pack's bytes
-        are never opened.
-        """
-        path = getattr(self.engine, "model_path", None)
-        if not isinstance(path, str) or not path:
-            return None
-        try:
-            info = os.stat(path)
-        except OSError:
-            return None
-        return {"filename": os.path.basename(os.path.realpath(path)),
-                "size_bytes": info.st_size, "mtime_ns": info.st_mtime_ns}
-
-    def admit_work(self) -> bool:
-        """Enter the work section: a request that will use the model or the GPU.
-
-        False when a maintenance reservation holds the admission shut: the request
-        is refused before it touches the model.
-        """
-        with self.admission:
-            if self.maintenance:
-                return False
-            self.work_active += 1
-            return True
-
-    def end_work(self) -> None:
-        """Leave the work section (every admitted request leaves it, error or not)."""
-        with self.admission:
-            self.work_active -= 1
-
-    def reserve_maintenance(self) -> str:
-        """Close the admission and unload between requests, so the pack file can be swapped.
-
-        "reserved" when the door is shut and the weights are unloaded; "busy" when a
-        request is admitted or the model is loading or booting, when another reservation
-        stands or is being established; "unsupported" when the engine cannot be unloaded
-        at all. A reservation that fails leaves the server exactly as it was: the door is
-        opened again and nothing is pretended. A standing reservation is never taken
-        over by another attempt.
-        """
-        result = self.begin_reservation()
-        return self.finish_reservation() if result == "reserving" else result
-
-    def begin_reservation(self) -> str:
-        """Close admission without unloading; a router can call this while holding its lock."""
-        with self.admission:
-            if self.maintenance:
-                # A reservation stands: this one does not take it over.
-                return "busy"
-            if self.reserving:
-                return "busy"                     # another reservation is still unloading
-            if self.work_active or self.loading or self.booting:
-                return "busy"
-            self.maintenance = True               # the door is shut from here on
-            self.reserving = True                 # ... and it is still being established
-        return "reserving"
-
-    def finish_reservation(self) -> str:
-        """Unload and complete a reservation begun by begin_reservation()."""
-        try:
-            result = self.unload()
-        except BaseException:
-            with self.admission:
-                self.maintenance = False
-                self.reserving = False
-            raise
-        with self.admission:
-            self.reserving = False
-            failed = result in ("busy", "unsupported")
-            if failed:
-                self.maintenance = False          # the weights are still there: no reservation is left
-        if failed:
-            return result
-        return "reserved"
-
-    def release_maintenance(self) -> bool:
-        """Reopen admission only after the reservation has finished unloading."""
-        with self.admission:
-            if self.reserving:
-                return False
-            self.maintenance = False
-            return True
-
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "basalt",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
@@ -194,10 +106,7 @@ class Service:
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
-        self.admission = threading.Lock()             # guards the work count and the maintenance flag
-        self.work_active = 0                          # work requests admitted and not yet finished
-        self.maintenance = False                      # a reservation holds the door shut for a pack swap
-        self.reserving = False                        # a reservation is unloading right now
+        self.init_controls()
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
@@ -839,9 +748,7 @@ class Service:
         images = self.vision is not None
         return {
             "service": "basalt", "model": self.model,
-            "control_features": list(CONTROL_FEATURES),
-            "maintenance": self.maintenance,
-            "pack": self.pack_info(),
+            **self.control_status(),
             "loaded": self.loaded(), "loading": self.loading, "load": self.load_progress(), "asleep": getattr(self.engine, "asleep", False) is True,
             "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "grammar",

@@ -47,10 +47,10 @@ class BlockingEngine(ScriptedEngine):
         self.generating = threading.Event()
         self.release = threading.Event()
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, **kwargs):
         self.generating.set()
         self.release.wait(30)
-        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings, **kwargs)
 
 
 class Maintenance(unittest.TestCase):

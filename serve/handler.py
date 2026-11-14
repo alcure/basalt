@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
+from serve.alcure import WORK_PATHS, count_prompt, reserve_pack
 from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.api.documents import sources as document_sources
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
@@ -31,7 +32,7 @@ from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.live import AnswerNowRefused
 from serve.router import Router
-from serve.service import CONTROL_FEATURES, LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
+from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
 
@@ -40,9 +41,7 @@ CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unlo
 # What this server offers beyond the OpenAI, Anthropic and llama.cpp APIs, listed under /props "basalt"
 CAPABILITIES = ["answer_now", "logprobs", "documents"]
 TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
-# Admission begins before the body identifies a model, so it covers every service.
-WORK_PATHS = ("/v1/responses", "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens",
-              "/v1/vram", "/v1/load", "/load")
+
 
 
 class BadBody(Exception):
@@ -386,8 +385,7 @@ def make_handler(target: Service | Router):
                                  "images": shown.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": shown.loaded(), "loading": shown.loading, "service": "basalt",
                                  "percent": load.get("percent") if load else None, "swap": router.swap_status(),
-                                 "control_features": list(CONTROL_FEATURES), "maintenance": shown.maintenance,
-                                 "pack": shown.pack_info()})
+                                 **shown.control_status()})
             elif path == "/status":
                 if not self._authorized():                  # it shows the last answer's tail
                     return
@@ -498,14 +496,7 @@ def make_handler(target: Service | Router):
                         if "reserve" in req and not isinstance(reserve, bool):
                             raise ValueError("reserve: true or false")
                         if reserve is True:
-                            # Router's preload can swap without an HTTP admission.
-                            with router.cv:
-                                if (router.swap or router.queue or router.running or
-                                        any(service.maintenance for service in router.services)):
-                                    raise ModelBusy("a request is running or queued")
-                                result = target.begin_reservation()
-                            if result == "reserving":
-                                result = target.finish_reservation()
+                            result = reserve_pack(router, target)
                             if result == "busy":
                                 raise ModelBusy("a request is running or queued")
                             if result == "unsupported":
@@ -912,23 +903,7 @@ def make_handler(target: Service | Router):
 
         def _count_tokens(self, req):
             """Count the rendered prompt and visual rows, without generating a reply."""
-            messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)
-            tools, _ = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)
-            stop_strings(req)
-            if images_of(messages):
-                self._take_turn()
-                self.svc.load()
-                try:
-                    ids, _, _ = self.svc.prepare(messages, tools, kw, 1, image_access=self._image_access())
-                    count = len(ids)
-                finally:
-                    path = getattr(self.svc.embeddings, "path", None)
-                    if path:
-                        Path(path).unlink(missing_ok=True)
-                        self.svc.embeddings.path = None
-            else:
-                count = len(self.svc.encode_prompt(messages, tools, kw))
-            self._json(200, {"input_tokens": count})
+            self._json(200, {"input_tokens": count_prompt(self, req)})
 
         def _anthropic(self, req):
             messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)
